@@ -1,0 +1,948 @@
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Absolute path to a fixture WASM under `tests/wasm/`.
+fn wasm(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("wasm")
+        .join(name)
+}
+
+/// Helper to write manifest content to a temp file and return its path.
+fn write_manifest(name: &str, contents: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, contents).expect("failed to write manifest file");
+    path
+}
+
+fn write_file(relative_name: &str, contents: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(relative_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create parent directory");
+    }
+    std::fs::write(&path, contents).expect("failed to write file");
+    path
+}
+
+fn portable(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+#[test]
+fn batch_manifest_toml_mode_fails_and_exits_one() {
+    // Generate a TOML manifest
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "breaking_contract"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v3.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_test.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1, "batch run with breaking contract must exit 1");
+
+    // Assert stdout/stderr output details
+    assert!(
+        stdout.contains("SOROBAN BATCH SAFETY REPORT"),
+        "Missing batch report header"
+    );
+    assert!(
+        stdout.contains("Overall Status: ❌ FAILED"),
+        "Missing failed status"
+    );
+    assert!(
+        stdout.contains("clean_contract: ✅ PASSED"),
+        "Missing passed contract summary"
+    );
+    assert!(
+        stdout.contains("breaking_contract: ❌ FAILED"),
+        "Missing failed contract summary"
+    );
+
+    // Progress messages go to stdout in default text mode.
+    assert!(
+        stdout.contains("Loaded 2 pair(s) for comparison."),
+        "Missing loading message"
+    );
+    assert!(
+        stdout.contains("Comparing contract pair: clean_contract"),
+        "Missing clean contract progress"
+    );
+    assert!(
+        stdout.contains("Comparing contract pair: breaking_contract"),
+        "Missing breaking contract progress"
+    );
+}
+
+#[test]
+fn batch_manifest_all_clean_exits_zero() {
+    // Generate a TOML manifest with all clean pairs
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_1"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_2"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v3.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v3.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_clean.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "batch run with all clean contracts must exit 0");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "Missing passed status"
+    );
+    assert!(
+        stdout.contains("interface-only"),
+        "Text output must identify interface-only coverage"
+    );
+}
+
+#[test]
+fn batch_manifest_json_mode_json_output() {
+    // Generate a JSON manifest
+    let manifest_content = format!(
+        r#"{{
+            "pairs": [
+                {{
+                    "old": {:?},
+                    "new": {:?},
+                    "name": "clean_json"
+                }},
+                {{
+                    "old": {:?},
+                    "new": {:?},
+                    "name": "breaking_json"
+                }}
+            ]
+        }}"#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v3.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v2.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_test.json", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1, "batch run with breaking contract must exit 1");
+
+    let json: Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["total_pairs"].as_u64().unwrap(), 2);
+
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an ordered array");
+    assert_eq!(results[0]["name"], "clean_json");
+    assert_eq!(results[1]["name"], "breaking_json");
+    assert_eq!(results[0]["report"]["is_safe"], Value::Bool(true));
+    assert_eq!(results[1]["report"]["is_safe"], Value::Bool(false));
+}
+
+#[test]
+fn batch_manifest_mixed_coverage_is_isolated_and_ordered() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mixed");
+    std::fs::create_dir_all(&root).expect("failed to create mixed manifest directory");
+    write_file("mixed/schemas/old.json", r#"{"declarations": []}"#);
+    write_file("mixed/schemas/new.json", r#"{"declarations": []}"#);
+    let invalid_schema = write_file("mixed/schemas/invalid.json", "not valid json");
+    let manifest_path = root.join("manifest.json");
+    let manifest = format!(
+        r#"{{
+            "pairs": [
+                {{"old": "{}", "new": "{}", "name": "interface_first"}},
+                {{"old": "{}", "new": "{}", "name": "schema_second",
+                 "old-storage-schema": "{}", "new-storage-schema": "{}"}},
+                {{"old": "{}", "new": "{}", "name": "invalid_third",
+                 "old_storage_schema": "{}", "new_storage_schema": "{}"}}
+            ]
+        }}"#,
+        portable(&wasm("v1.wasm")),
+        portable(&wasm("v3.wasm")),
+        portable(&wasm("v1.wasm")),
+        portable(&wasm("v3.wasm")),
+        "schemas/old.json",
+        "schemas/new.json",
+        portable(&wasm("v1.wasm")),
+        portable(&wasm("v3.wasm")),
+        portable(&invalid_schema),
+        portable(&invalid_schema),
+    );
+    std::fs::write(&manifest_path, manifest).expect("failed to write mixed manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "output must be JSON: {error}\n---stderr---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let results = json["results"].as_array().expect("results must be ordered");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["name"], "interface_first");
+    assert_eq!(results[0]["coverage"], "interface-only");
+    assert_eq!(results[1]["name"], "schema_second");
+    assert_eq!(results[1]["coverage"], "schema-backed");
+    assert_eq!(results[2]["name"], "invalid_third");
+    assert_eq!(results[2]["coverage"], "error");
+    assert!(results[2]["error"].as_str().unwrap().contains("invalid"));
+}
+
+#[test]
+fn batch_manifest_partial_schema_is_pair_error_without_aborting_next_pair() {
+    let schema = write_file("partial/old.json", r#"{"declarations": []}"#);
+    let manifest = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "partial"
+        old_storage_schema = {:?}
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "after_partial"
+        "#,
+        wasm("v1.wasm").display().to_string(),
+        wasm("v3.wasm").display().to_string(),
+        schema.display().to_string(),
+        wasm("v1.wasm").display().to_string(),
+        wasm("v3.wasm").display().to_string(),
+    );
+    let manifest_path = write_manifest("partial_manifest.toml", &manifest);
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("output must be JSON");
+    let results = json["results"].as_array().expect("results must be ordered");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(results[0]["name"], "partial");
+    assert_eq!(results[0]["coverage"], "error");
+    assert!(results[0]["error"].as_str().unwrap().contains("partial"));
+    assert_eq!(results[1]["name"], "after_partial");
+    assert_eq!(results[1]["coverage"], "interface-only");
+}
+
+#[test]
+fn committed_mixed_manifest_fixture_resolves_relative_paths() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("batch")
+        .join("mixed.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--manifest", manifest.to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("failed to run committed fixture");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("output must be JSON");
+    let results = json["results"].as_array().expect("results must be ordered");
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0]["coverage"], "schema-backed");
+    assert_eq!(results[1]["coverage"], "interface-only");
+    assert_eq!(results[2]["coverage"], "error");
+    assert_eq!(results[3]["coverage"], "error");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn batch_markdown_output_shows_scope_and_coverage_columns() {
+    let manifest = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "markdown_contract"
+        "#,
+        wasm("v1.wasm").to_string_lossy(),
+        wasm("v3.wasm").to_string_lossy(),
+    );
+    let manifest_path = write_manifest("markdown_manifest.toml", &manifest);
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--format",
+            "markdown",
+        ])
+        .output()
+        .expect("failed to run binary");
+    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("| Scope | Coverage |"));
+    assert!(stdout.contains("interface-only"));
+}
+
+#[test]
+fn batch_directory_scanning_fails_on_breaking_contract() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    // Copy fixtures:
+    // a.wasm: clean (v1 -> v1)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy");
+
+    // b.wasm: breaking (v1 -> v2)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("b.wasm")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_dir.join("b.wasm")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1);
+    assert!(stdout.contains("Overall Status: ❌ FAILED"));
+    assert!(stdout.contains("a: ✅ PASSED"));
+    assert!(stdout.contains("b: ❌ FAILED"));
+}
+
+#[test]
+fn batch_directory_scanning_accepts_uppercase_wasm_extension() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_upper_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    // Copy fixtures with uppercase .WASM extensions:
+    // a.WASM: clean (v1 -> v1)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.WASM")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.WASM")).expect("copy");
+
+    // b.WASM: breaking (v1 -> v2)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("b.WASM")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_dir.join("b.WASM")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1);
+    assert!(stdout.contains("Overall Status: ❌ FAILED"));
+    assert!(stdout.contains("a: ✅ PASSED"));
+    assert!(stdout.contains("b: ❌ FAILED"));
+}
+
+#[test]
+fn batch_conflicting_options_exit_with_error() {
+    // 1. Both manifest and old-dir/new-dir
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args([
+            "--manifest",
+            "dummy.toml",
+            "--old-dir",
+            "dummy_old",
+            "--new-dir",
+            "dummy_new",
+        ])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "conflicting batch options must fail"
+    );
+
+    // 2. Positional args + manifest
+    let output2 = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--manifest", "dummy.toml"])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output2.status.success(),
+        "positional args + manifest must fail"
+    );
+}
+
+#[test]
+fn batch_directory_ignores_unrelated_files() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
+
+    std::fs::write(old_dir.join("readme.txt"), "project notes").expect("write readme");
+    std::fs::write(old_dir.join("config.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("Makefile"), "build:\n\tcargo build").expect("write makefile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "all-safe batch must exit 0");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "stdout must show overall passed"
+    );
+    assert!(
+        stdout.contains("a: ✅ PASSED"),
+        "stdout must list the valid WASM pair"
+    );
+    assert!(
+        !stdout.contains("readme.txt"),
+        "unrelated readme.txt must not appear in output"
+    );
+    assert!(
+        !stdout.contains("config.json"),
+        "unrelated config.json must not appear in output"
+    );
+    assert!(
+        !stdout.contains("Makefile"),
+        "unrelated Makefile must not appear in output"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for non-WASM files"
+    );
+    assert!(
+        !stderr.contains("readme.txt"),
+        "stderr must not mention unrelated files"
+    );
+}
+
+#[test]
+fn batch_directory_ignores_unrelated_files_json() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_json_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
+
+    std::fs::write(old_dir.join("notes.txt"), "some notes").expect("write txt");
+    std::fs::write(old_dir.join("data.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("script"), "echo hello").expect("write script");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    assert_eq!(code, 0);
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an array");
+    let contract_a = results
+        .iter()
+        .find(|r| r["name"] == "a")
+        .expect("JSON results must contain the valid WASM pair 'a'");
+    assert_eq!(
+        contract_a["report"]["is_safe"],
+        Value::Bool(true),
+        "contract 'a' must be safe"
+    );
+
+    assert!(
+        !stdout.contains("notes.txt"),
+        "JSON must not contain unrelated txt file"
+    );
+    assert!(
+        !stdout.contains("data.json"),
+        "JSON must not contain unrelated json file"
+    );
+    assert!(
+        !stdout.contains("script"),
+        "JSON must not contain unrelated extensionless file"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for dotfile WASM"
+    );
+}
+
+/// Build an `old`/`new` pair of directories under a uniquely named subdirectory
+/// of `CARGO_TARGET_TMPDIR`, so parallel tests never share a tree.
+fn dir_scan_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("exclude-{name}"));
+    let old_dir = base.join("old");
+    let new_dir = base.join("new");
+    std::fs::create_dir_all(&old_dir).expect("failed to create old dir");
+    std::fs::create_dir_all(&new_dir).expect("failed to create new dir");
+    (old_dir, new_dir)
+}
+
+fn place(old_dir: &Path, new_dir: &Path, name: &str, old_fixture: &str, new_fixture: &str) {
+    std::fs::copy(wasm(old_fixture), old_dir.join(name)).expect("copy old wasm");
+    std::fs::copy(wasm(new_fixture), new_dir.join(name)).expect("copy new wasm");
+}
+
+#[test]
+fn batch_directory_exclude_glob_skips_matching_pair() {
+    let (old_dir, new_dir) = dir_scan_fixture("skips-pair");
+
+    // `token.wasm` is the pair a user would want left out; `real.wasm` must
+    // still be compared, and it changes behaviour between the two sides so a
+    // run that compared everything could not be mistaken for a run that did.
+    place(&old_dir, &new_dir, "token.wasm", "v1.wasm", "v1.wasm");
+    place(&old_dir, &new_dir, "real.wasm", "v1.wasm", "v2.wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--exclude", "token.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(
+        code, 1,
+        "the remaining breaking pair must still fail the run"
+    );
+
+    // The excluded pair was not compared...
+    assert!(
+        !stdout.contains("token: "),
+        "excluded pair must not appear as a compared contract, got: {stdout}"
+    );
+    // ...and it was said out loud, on both sides, with the pattern responsible.
+    assert!(
+        stdout.contains("Skipped 2 .wasm artifact(s) matching --exclude:"),
+        "stdout must report both excluded files, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("token.wasm [old dir] matched 'token.wasm'"),
+        "stdout must attribute the old-side skip to the pattern, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("token.wasm [new dir] matched 'token.wasm'"),
+        "stdout must attribute the new-side skip to the pattern, got: {stdout}"
+    );
+
+    // The pair that was left in is still judged.
+    assert!(
+        stdout.contains("real: ❌ FAILED"),
+        "non-excluded pair must still be compared, got: {stdout}"
+    );
+    // A skip is not a failure, so it must not be dressed up as a warning.
+    assert!(
+        stdout.contains("These were not compared and did not affect the verdict."),
+        "stdout must say the skips did not change the verdict, got: {stdout}"
+    );
+}
+
+#[test]
+fn batch_directory_exclude_glob_applies_to_both_sides() {
+    let (old_dir, new_dir) = dir_scan_fixture("both-sides");
+
+    // One artifact that only exists in each direction: excluding it has to
+    // suppress the removed-contract and added-contract verdicts too, not just
+    // the matched-pair case.
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("gone.wasm")).expect("copy old wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("added.wasm")).expect("copy new wasm");
+    place(&old_dir, &new_dir, "kept.wasm", "v1.wasm", "v2.wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--exclude", "gone.wasm", "--exclude", "added.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    // Without the exclusion, a file present on one side only is a Critical
+    // finding on both counts.
+    assert!(
+        !stdout.contains("Only in old"),
+        "excluded old-only artifact must not be reported as removed, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Only in new"),
+        "excluded new-only artifact must not be reported as added, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Only in old") && !stderr.contains("Only in new"),
+        "excluded artifacts must not leak into stderr, got: {stderr}"
+    );
+
+    // Both repeats are honoured, and each skip names its own pattern.
+    assert!(
+        stdout.contains("Skipped 2 .wasm artifact(s) matching --exclude:"),
+        "both excluded artifacts must be reported, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("gone.wasm [old dir] matched 'gone.wasm'"),
+        "old-side skip must be reported, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("added.wasm [new dir] matched 'added.wasm'"),
+        "new-side skip must be reported, got: {stdout}"
+    );
+
+    assert_eq!(
+        code, 1,
+        "the remaining breaking pair must still fail the run"
+    );
+    assert!(
+        stdout.contains("kept: ❌ FAILED"),
+        "non-excluded pair must still be compared, got: {stdout}"
+    );
+}
+
+#[test]
+fn batch_directory_exclude_wildcard_selects_by_glob_not_by_literal_name() {
+    let (old_dir, new_dir) = dir_scan_fixture("wildcard");
+
+    place(&old_dir, &new_dir, "keep.wasm", "v1.wasm", "v1.wasm");
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("vendor-a.wasm")).expect("copy old wasm");
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("vendor-b.wasm")).expect("copy old wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("vendor-c.wasm")).expect("copy new wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--exclude", "vendor-?.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(
+        code, 0,
+        "only the clean kept pair remains, so the run must pass, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped 3 .wasm artifact(s) matching --exclude:"),
+        "all three vendored artifacts must be skipped, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("keep: ✅ PASSED"),
+        "the non-excluded pair must still be compared, got: {stdout}"
+    );
+}
+
+#[test]
+fn batch_directory_exclude_reports_error_when_everything_is_excluded() {
+    let (old_dir, new_dir) = dir_scan_fixture("all-excluded");
+
+    place(&old_dir, &new_dir, "token.wasm", "v1.wasm", "v2.wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--exclude", "token.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1, "an empty scan must exit 1");
+    // The generic "no .wasm files" wording would send the reader looking for
+    // missing build artifacts that are sitting right there, so the diagnostic
+    // has to name the patterns that removed them.
+    assert!(
+        stderr.contains("Every .wasm artifact present was excluded by: 'token.wasm'"),
+        "the empty-scan error must name the responsible pattern, got: {stderr}"
+    );
+}
+
+#[test]
+fn batch_directory_exclude_is_rejected_outside_directory_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--exclude", "*.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1, "--exclude outside directory mode must exit 1");
+    assert!(
+        stderr.contains("Cannot use --exclude outside directory mode"),
+        "the flag must be rejected with an explanation, got: {stderr}"
+    );
+}
+
+#[test]
+fn batch_directory_exclude_keeps_json_schema_unchanged() {
+    let (old_dir, new_dir) = dir_scan_fixture("json");
+
+    place(&old_dir, &new_dir, "token.wasm", "v1.wasm", "v1.wasm");
+    place(&old_dir, &new_dir, "real.wasm", "v1.wasm", "v1.wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json", "--exclude", "token.wasm"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    assert_eq!(code, 0, "the only remaining pair is clean");
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an array");
+    assert_eq!(
+        results.len(),
+        1,
+        "the excluded pair must not be a result row, got: {stdout}"
+    );
+    assert_eq!(results[0]["name"], "real", "only the kept pair is reported");
+}
+
+#[test]
+fn batch_directory_exclude_stays_quiet_under_quiet_output() {
+    let (old_dir, new_dir) = dir_scan_fixture("quiet");
+
+    place(&old_dir, &new_dir, "token.wasm", "v1.wasm", "v2.wasm");
+    place(&old_dir, &new_dir, "real.wasm", "v1.wasm", "v1.wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--exclude", "token.wasm", "--quiet"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "the only compared pair is clean, got: {stdout}");
+    // The skip notice is progress narration, so it follows the same --quiet
+    // contract as the rest of the progress lines and never lands on stderr,
+    // which JSON and CI consumers parse.
+    assert!(
+        !stdout.contains("Skipped"),
+        "--quiet must suppress the skip narration, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Skipped"),
+        "skip narration must not be written to stderr, got: {stderr}"
+    );
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "the report itself is still printed, got: {stdout}"
+    );
+}
+
+#[test]
+fn batch_directory_handles_dotfile_wasm() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dotfile_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join(".baseline.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join(".baseline.wasm")).expect("copy wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "all-safe batch must exit 0");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "stdout must show overall passed"
+    );
+    assert!(
+        stdout.contains(".baseline"),
+        "stdout must contain the dotfile contract name '.baseline'"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for dotfile WASM"
+    );
+}
+
+#[test]
+fn batch_directory_handles_dotfile_wasm_json() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dotfile_json_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join(".baseline.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join(".baseline.wasm")).expect("copy wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    assert_eq!(code, 0);
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an array");
+    let baseline = results
+        .iter()
+        .find(|r| r["name"] == ".baseline")
+        .expect("JSON results must contain the dotfile contract name '.baseline'");
+    assert_eq!(
+        baseline["report"]["is_safe"],
+        Value::Bool(true),
+        "contract '.baseline' must be safe"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for dotfile WASM"
+    );
+}
